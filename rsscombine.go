@@ -2,11 +2,12 @@ package main
 
 import (
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -18,41 +19,38 @@ import (
 	"mvdan.cc/xurls"
 )
 
-func getUrlsFromFeedsUrl(feeds_url string) []string {
-	log.Printf("Loading feed URLs from: %v", feeds_url)
+func getURLsFromFeedsURL(feedsURL string) ([]string, error) {
+	log.Printf("Loading feed URLs from: %v", feedsURL)
 	client := &http.Client{
 		Timeout: time.Duration(viper.GetInt("client_timeout_seconds")) * time.Second,
 	}
-	response, err := client.Get(feeds_url)
+	response, err := client.Get(feedsURL)
 	if err != nil {
-		log.Fatal(err)
-	} else {
-		defer response.Body.Close()
-		contents, err := ioutil.ReadAll(response.Body)
-		if err != nil {
-			log.Fatal(err)
-		} else {
-			stringContents := string(contents)
-			// TODO: this is a hack
-			for _, exclude := range viper.GetStringSlice("feed_exclude_prefixes") {
-				stringContents = strings.Replace(stringContents, exclude, "", -1)
-			}
-			feed_urls := xurls.Strict.FindAllString(stringContents, -1)
-			return feed_urls
-		}
+		return nil, err
 	}
-	return nil
+	defer response.Body.Close()
+	contents, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, err
+	}
+	stringContents := string(contents)
+	// TODO: this is a hack
+	for _, exclude := range viper.GetStringSlice("feed_exclude_prefixes") {
+		stringContents = strings.Replace(stringContents, exclude, "", -1)
+	}
+	feedURLs := xurls.Strict.FindAllString(stringContents, -1)
+	return feedURLs, nil
 }
 
-func getUrls() []string {
-	feeds_url := viper.GetString("feed_urls")
-	if feeds_url != "" {
-		return getUrlsFromFeedsUrl(feeds_url)
+func getURLs() ([]string, error) {
+	feedsURL := viper.GetString("feed_urls")
+	if feedsURL != "" {
+		return getURLsFromFeedsURL(feedsURL)
 	}
-	return viper.GetStringSlice("feeds")
+	return viper.GetStringSlice("feeds"), nil
 }
 
-func fetchUrl(url string, ch chan<- *gofeed.Feed) {
+func fetchURL(url string, ch chan<- *gofeed.Feed) {
 	log.Printf("Fetching URL: %v\n", url)
 	fp := gofeed.NewParser()
 	fp.Client = &http.Client{
@@ -67,11 +65,11 @@ func fetchUrl(url string, ch chan<- *gofeed.Feed) {
 	}
 }
 
-func fetchUrls(urls []string) []*gofeed.Feed {
+func fetchURLs(urls []string) []*gofeed.Feed {
 	allFeeds := make([]*gofeed.Feed, 0)
 	ch := make(chan *gofeed.Feed)
 	for _, url := range urls {
-		go fetchUrl(url, ch)
+		go fetchURL(url, ch)
 	}
 	for range urls {
 		feed := <-ch
@@ -94,29 +92,42 @@ func (s byPublished) Swap(i, j int) {
 }
 
 func (s byPublished) Less(i, j int) bool {
-	date1 := s[i].Items[0].PublishedParsed
-	if date1 == nil {
-		date1 = s[i].Items[0].UpdatedParsed
+	date1 := feedDate(s[i])
+	date2 := feedDate(s[j])
+	if date1 == nil && date2 == nil {
+		return false
 	}
-	date2 := s[j].Items[0].PublishedParsed
+	if date1 == nil {
+		return true
+	}
 	if date2 == nil {
-		date2 = s[j].Items[0].UpdatedParsed
+		return false
 	}
 	return date1.Before(*date2)
+}
+
+func feedDate(f *gofeed.Feed) *time.Time {
+	if len(f.Items) == 0 {
+		return nil
+	}
+	if f.Items[0].PublishedParsed != nil {
+		return f.Items[0].PublishedParsed
+	}
+	return f.Items[0].UpdatedParsed
 }
 
 func getAuthor(feed *gofeed.Feed) string {
 	if feed.Author != nil {
 		return feed.Author.Name
 	}
-	if feed.Items[0].Author != nil {
+	if len(feed.Items) > 0 && feed.Items[0].Author != nil {
 		return feed.Items[0].Author.Name
 	}
 	log.Printf("Could not determine author for %v", feed.Link)
 	return viper.GetString("default_author_name")
 }
 
-func combineallFeeds(allFeeds []*gofeed.Feed) *feeds.Feed {
+func combineAllFeeds(allFeeds []*gofeed.Feed) *feeds.Feed {
 	feed := &feeds.Feed{
 		Title:       viper.GetString("title"),
 		Link:        &feeds.Link{Href: viper.GetString("link")},
@@ -128,12 +139,15 @@ func combineallFeeds(allFeeds []*gofeed.Feed) *feeds.Feed {
 		Created: time.Now(),
 	}
 	sort.Sort(sort.Reverse(byPublished(allFeeds)))
-	limit_per_feed := viper.GetInt("feed_limit_per_feed")
+	limitPerFeed := viper.GetInt("feed_limit_per_feed")
 	seen := make(map[string]bool)
 	for _, sourceFeed := range allFeeds {
 		for i, item := range sourceFeed.Items {
-			if i > limit_per_feed {
+			if i >= limitPerFeed {
 				break
+			}
+			if item == nil {
+				continue
 			}
 			if seen[item.Link] {
 				continue
@@ -141,6 +155,10 @@ func combineallFeeds(allFeeds []*gofeed.Feed) *feeds.Feed {
 			created := item.PublishedParsed
 			if created == nil {
 				created = item.UpdatedParsed
+			}
+			if created == nil {
+				now := time.Now()
+				created = &now
 			}
 			feed.Items = append(feed.Items, &feeds.Item{
 				Title:       item.Title,
@@ -156,11 +174,13 @@ func combineallFeeds(allFeeds []*gofeed.Feed) *feeds.Feed {
 	return feed
 }
 
-func GetAtomFeed() *feeds.Feed {
-	urls := getUrls()
-	allFeeds := fetchUrls(urls)
-	combinedFeed := combineallFeeds(allFeeds)
-	return combinedFeed
+func GetAtomFeed() (*feeds.Feed, error) {
+	urls, err := getURLs()
+	if err != nil {
+		return nil, err
+	}
+	allFeeds := fetchURLs(urls)
+	return combineAllFeeds(allFeeds), nil
 }
 
 func LoadConfig() {
@@ -173,24 +193,78 @@ func LoadConfig() {
 	viper.SetDefault("feed_limit_per_feed", "20")
 	err := viper.ReadInConfig()
 	if err != nil {
-		panic(fmt.Errorf("Fatal error config file: %s \n", err))
+		panic(fmt.Errorf("fatal error config file: %w", err))
+	}
+}
+
+func runServer(port string) {
+	cacheTimeout := time.Duration(viper.GetInt("cache_timeout_seconds")) * time.Second
+	var (
+		mu          sync.Mutex
+		cachedAtom  string
+		cacheExpiry time.Time
+	)
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+
+		if time.Now().After(cacheExpiry) || cachedAtom == "" {
+			feed, err := GetAtomFeed()
+			if err != nil {
+				log.Printf("Error fetching feeds: %v", err)
+				http.Error(w, "Failed to fetch feeds", http.StatusInternalServerError)
+				return
+			}
+			atom, err := feed.ToAtom()
+			if err != nil {
+				log.Printf("Error rendering feed: %v", err)
+				http.Error(w, "Failed to render feed", http.StatusInternalServerError)
+				return
+			}
+			cachedAtom = atom
+			cacheExpiry = time.Now().Add(cacheTimeout)
+			log.Printf("Cache refreshed with %v items, next refresh in %v", len(feed.Items), cacheTimeout)
+		}
+
+		w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+		fmt.Fprint(w, cachedAtom)
+	})
+
+	log.Printf("Starting server on http://localhost:%v", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Server failed: %v", err)
 	}
 }
 
 func main() {
 	LoadConfig()
+
+	port := viper.GetString("port")
+	if port != "" {
+		runServer(port)
+		return
+	}
+
 	bucket := viper.GetString("s3_bucket")
 	filename := viper.GetString("s3_filename")
-	combinedFeed := GetAtomFeed()
-	atom, _ := combinedFeed.ToAtom()
+	combinedFeed, err := GetAtomFeed()
+	if err != nil {
+		log.Fatalf("Failed to get atom feed: %v", err)
+	}
+	atom, err := combinedFeed.ToAtom()
+	if err != nil {
+		log.Fatalf("Failed to render atom feed: %v", err)
+	}
 	log.Printf("Rendered RSS with %v items", len(combinedFeed.Items))
-	// if no S3 bucket is defined, simply print the feed on standard output
 	if len(bucket) == 0 {
 		fmt.Print(atom)
 		return
 	}
-	// Upload the feed to S3
 	sess, err := session.NewSession(&aws.Config{})
+	if err != nil {
+		log.Fatalf("Failed to create AWS session: %v", err)
+	}
 	uploader := s3manager.NewUploader(sess)
 	_, err = uploader.Upload(&s3manager.UploadInput{
 		Bucket:      aws.String(bucket),
