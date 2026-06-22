@@ -3,8 +3,6 @@ link: http://localhost:8080
 description: My personal collection of feeds
 author_name: Yousaf
 author_email: fop.khan@gmail.com
-port: 8080
-cache_timeout_seconds: 600
 feeds:
   - https://rss.app/feeds/U0i6RfkK7W03WIn1.xml
   - https://rss.app/feeds/iv1rRv2zYV1GcJBs.xml
