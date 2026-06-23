@@ -26,19 +26,20 @@ jobs:
         run: go mod download
 
       - name: Generate combined feed
-        run: |
-          mkdir -p public
-          go run rsscombine.go > public/combined.xml
-          echo "Generated $(wc -l < public/combined.xml) lines"
+        run: go run rsscombine.go > /tmp/combined.xml
 
       - name: Commit and push feed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch origin master
+          git reset --hard origin/master
+          mkdir -p public
+          cp /tmp/combined.xml public/combined.xml
           git add public/combined.xml
           if ! git diff --cached --quiet; then
             git commit -m "Update combined RSS feed"
-            git push --force-with-lease
+            git push
           else
             echo "No changes to commit"
           fi
