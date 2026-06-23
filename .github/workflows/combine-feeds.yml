@@ -22,13 +22,14 @@ jobs:
           go-version: '1.19'
           cache: true
 
-      - name: Build
-        run: go build -v ./...
+      - name: Download dependencies
+        run: go mod download
 
       - name: Generate combined feed
         run: |
           mkdir -p public
           go run rsscombine.go > public/combined.xml
+          echo "Generated $(wc -l < public/combined.xml) lines"
 
       - name: Commit and push feed
         run: |
